@@ -3,6 +3,7 @@ import argparse
 import logging
 import pandas as pd
 import numpy as np
+from tqdm import tqdm
 import torch
 import transformers
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
@@ -31,33 +32,54 @@ class Binoculars:
         performer_name_or_path: str = "tiiuae/falcon-7b-instruct",
         use_bfloat16: bool = True,
         max_token_observed: int = 512,
+        use_fp16: bool = False,
+
         mode: str = "low-fpr",
         low_fpr_threshold: float = DEFAULT_BINOCULARS_FPR_THRESHOLD,
         accuracy_threshold: float = DEFAULT_BINOCULARS_ACCURACY_THRESHOLD,
     ) -> None:
+        self.use_fp16 = use_fp16
+        self.use_bfloat16 = use_bfloat16
+
         self._assert_tokenizer_consistency(observer_name_or_path, performer_name_or_path)
         self.change_mode(mode, low_fpr_threshold, accuracy_threshold)
         # Use BitsAndBytesConfig for 8-bit quantization.
+
+        if self.use_bfloat16 and torch.cuda.is_bf16_supported():
+            dtype = torch.bfloat16
+        elif self.use_fp16:
+            dtype = torch.float16
+        else:
+            dtype = torch.float32
+
         quant_config = BitsAndBytesConfig(load_in_4bit=True)
+
         self.observer_model = AutoModelForCausalLM.from_pretrained(
             observer_name_or_path,
             quantization_config=quant_config,
             device_map=DEVICE_1,
             trust_remote_code=True,
-            torch_dtype="auto",
+            torch_dtype=dtype,
             token=os.environ.get("HF_TOKEN", None)
         )
+        torch.cuda.empty_cache()   # clear leftover
         self.performer_model = AutoModelForCausalLM.from_pretrained(
             performer_name_or_path,
             quantization_config=quant_config,
             device_map=DEVICE_2,
             trust_remote_code=True,
-            torch_dtype="auto",
+            torch_dtype=dtype,
             token=os.environ.get("HF_TOKEN", None)
         )
+        torch.cuda.empty_cache()
         print("models loaded")
         self.observer_model.eval()
+        torch.cuda.empty_cache()
         self.performer_model.eval()
+        torch.cuda.empty_cache()
+
+#        self.observer_model.eval()
+#        self.performer_model.eval()
         self.tokenizer = AutoTokenizer.from_pretrained(observer_name_or_path)
         if not self.tokenizer.pad_token:
             self.tokenizer.pad_token = self.tokenizer.eos_token
@@ -109,6 +131,30 @@ class Binoculars:
         scores = np.array(self.compute_score(input_text))
         predictions = np.where(scores < self.threshold, "machine", "human")
         return predictions.tolist() if isinstance(input_text, list) else predictions.item()
+    
+    def predict_in_batches(
+        self,
+        texts: List[str],
+        batch_size: int = 4,
+        show_progress: bool = True
+    ) -> List[str]:
+        """
+        Predict on `texts` in mini‐batches, showing progress in terminal.
+        """
+        all_preds = []
+        num_batches = (len(texts) + batch_size - 1) // batch_size
+
+        iterator = range(0, len(texts), batch_size)
+        if show_progress:
+            iterator = tqdm(iterator, total=num_batches, desc="Batches")
+
+        for start in iterator:
+            batch = texts[start : start + batch_size]
+            preds = self.predict(batch)
+            all_preds.extend(preds)
+            torch.cuda.empty_cache()
+
+        return all_preds
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
@@ -132,6 +178,12 @@ if __name__ == "__main__":
                         help="Threshold for low-fpr mode.")
     parser.add_argument("--accuracy_threshold", default=DEFAULT_BINOCULARS_ACCURACY_THRESHOLD, type=float,
                         help="Threshold for accuracy mode.")
+    parser.add_argument(
+        "--fp16",
+        action="store_true",
+        help="Load models in float16 precision (half-precision) if available."
+    )
+
     
     args = parser.parse_args()
     
@@ -140,6 +192,13 @@ if __name__ == "__main__":
         raise ValueError(f"Test file does not exist: {args.test_file_path}")
     
     test_df = pd.read_csv(args.test_file_path)
+    texts = test_df["text"].tolist()
+    ids   = test_df["id"].tolist()
+    batch_size = 16
+    all_preds = []
+    # number of row-batches
+    num_batches = (len(texts) + batch_size - 1) // batch_size
+
     if "id" not in test_df.columns or "text" not in test_df.columns:
         logging.error("Test file must contain 'id' and 'text' columns.")
         raise ValueError("Test file must contain 'id' and 'text' columns.")
@@ -154,12 +213,22 @@ if __name__ == "__main__":
         accuracy_threshold=args.accuracy_threshold
     )
     
-    test_texts = test_df["text"].tolist()
-    preds = binoculars.predict(test_texts)
+    #test_texts = test_df["text"].tolist()
+    #preds = binoculars.predict_in_batches(test_texts, batch_size=16, show_progress=True)
+
+        # iterate over DataFrame *rows* in chunks
+    for start in tqdm(range(0, len(texts), batch_size), desc="Row-batches", total=num_batches):
+        end    = start + batch_size
+        batch_texts = texts[start:end]        # full, un-chunked rows
+        batch_preds = binoculars.predict(batch_texts)
+        all_preds.extend(batch_preds)
+        torch.cuda.empty_cache()              # reclaim any GPU RAM
+
     
+    # now all_preds[i] corresponds to texts[i]/ids[i]
     predictions_df = pd.DataFrame({
-        "id": test_df["id"],
-        "label": preds
+        "id":    ids,
+        "label": all_preds
     })
     predictions_df.to_csv(args.prediction_file_path, index=False)
     print(f"Predictions saved to {args.prediction_file_path}")
